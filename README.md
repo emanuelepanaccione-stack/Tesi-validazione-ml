@@ -1,6 +1,6 @@
 # Analisi delle Tecniche di Validazione di Modelli di Machine Learning in Scenari di Big Data
 
-Benvenuti nella repository ufficiale associata alla tesi di laurea in Data Science / Machine Learning dal titolo **"[Inserisci il Titolo Esatto della tua Tesi]"**.
+Benvenuti nella repository ufficiale associata alla tesi di laurea in Data Science / Machine Learning dal titolo **"Analisi delle tecniche di validazione dei modelli di Machine Learning in scenari di Big Data"**.
 
 Questo spazio raccoglie tutto il codice sorgente, gli script di pipeline e le configurazioni architetturali sviluppate durante il lavoro di ricerca e sperimentazione.
 
