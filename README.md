@@ -22,4 +22,4 @@ La repository è organizzata come segue:
 ---
 *Candidato: Emanuele Panaccione*  
 *Relatore: Prof. Bellone Mauro*  
-*Università degli Studi Mercatorum] - Anno Accademico 2025/2026*
+*Università degli Studi Mercatorum - Anno Accademico 2025/2026*
