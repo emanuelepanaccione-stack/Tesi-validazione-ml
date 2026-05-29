@@ -1,0 +1,204 @@
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, FloatType, IntegerType
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.feature import StandardScaler, VectorAssembler, Imputer
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# ─────────────────────────────────────────────
+# 0. LOGGING & SPARK SESSION
+# ─────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
+logger = logging.getLogger(__name__)
+
+spark = (
+    SparkSession.builder
+    .appName("ML_Pipeline_CrossValidation")
+    .config("spark.sql.shuffle.partitions", "200")
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+logger.info("SparkSession inizializzata correttamente.")
+
+
+# ─────────────────────────────────────────────
+# 1. SCHEMA ESPLICITO & CARICAMENTO DATI
+# ─────────────────────────────────────────────
+FEATURE_COLS = ["feature_1", "feature_2", "feature_3"]
+LABEL_COL    = "label"
+RAW_VEC_COL  = "raw_features"
+SCALED_COL   = "scaled_features"
+
+schema = StructType([
+    StructField("feature_1", FloatType(), nullable=True),
+    StructField("feature_2", FloatType(), nullable=True),
+    StructField("feature_3", FloatType(), nullable=True),
+    StructField("label",     IntegerType(), nullable=False),
+])
+
+# ── Sostituisci con il tuo path reale ──
+RAW_DATA_PATH  = "/data/input/dataset.parquet"
+MODEL_SAVE_PATH = "/data/models/best_lr_pipeline"
+
+df = spark.read.schema(schema).parquet(RAW_DATA_PATH)
+logger.info(f"Dataset caricato — righe: {df.count()}, colonne: {df.columns}")
+
+
+# ─────────────────────────────────────────────
+# 2. VALIDAZIONE & QUALITY CHECK
+# ─────────────────────────────────────────────
+null_counts = {c: df.filter(F.col(c).isNull()).count() for c in FEATURE_COLS}
+logger.info(f"Valori nulli per feature: {null_counts}")
+
+# Rimozione righe con label nulla (non imputabile)
+df = df.filter(F.col(LABEL_COL).isNotNull())
+
+# Cast esplicito a Double (richiesto da Spark ML)
+for col in FEATURE_COLS:
+    df = df.withColumn(col, F.col(col).cast("double"))
+df = df.withColumn(LABEL_COL, F.col(LABEL_COL).cast("double"))
+
+
+# ─────────────────────────────────────────────
+# 3. SPLIT TRAIN / TEST  (stratificato per label)
+# ─────────────────────────────────────────────
+train_df, test_df = df.randomSplit([0.8, 0.2], seed=42)
+train_df = train_df.cache()
+test_df  = test_df.cache()
+logger.info(f"Train: {train_df.count()} righe — Test: {test_df.count()} righe")
+
+
+# ─────────────────────────────────────────────
+# 4. DEFINIZIONE DEGLI STAGE DELLA PIPELINE
+# ─────────────────────────────────────────────
+
+# Stage 1 — Imputazione valori mancanti (media per colonna, calcolata SOLO sul train fold)
+imputer = Imputer(
+    inputCols=FEATURE_COLS,
+    outputCols=FEATURE_COLS,
+    strategy="mean"
+)
+
+# Stage 2 — Assemblaggio vettore feature
+assembler = VectorAssembler(
+    inputCols=FEATURE_COLS,
+    outputCol=RAW_VEC_COL,
+    handleInvalid="skip"    # scarta righe con valori non gestiti residui
+)
+
+# Stage 3 — Standardizzazione (μ=0, σ=1) — fittata SOLO sui fold di training
+scaler = StandardScaler(
+    inputCol=RAW_VEC_COL,
+    outputCol=SCALED_COL,
+    withStd=True,
+    withMean=True
+)
+
+# Stage 4 — Classificatore con regolarizzazione elasticNet
+lr = LogisticRegression(
+    featuresCol=SCALED_COL,
+    labelCol=LABEL_COL,
+    predictionCol="prediction",
+    probabilityCol="probability",
+    rawPredictionCol="rawPrediction",
+    maxIter=200,
+    tol=1e-6,
+    elasticNetParam=0.0,    # 0.0 = Ridge (L2), 1.0 = Lasso (L1)
+    family="auto"           # auto → binomial o multinomial in base alle classi
+)
+
+
+# ─────────────────────────────────────────────
+# 5. COSTRUZIONE PIPELINE
+# ─────────────────────────────────────────────
+pipeline = Pipeline(stages=[imputer, assembler, scaler, lr])
+
+
+# ─────────────────────────────────────────────
+# 6. GRIGLIA DEGLI IPERPARAMETRI
+# ─────────────────────────────────────────────
+paramGrid = (
+    ParamGridBuilder()
+    .addGrid(lr.regParam,        [0.001, 0.01, 0.1, 1.0])
+    .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
+    .addGrid(lr.maxIter,         [100, 200])
+    .build()
+)
+logger.info(f"Combinazioni totali nella grid: {len(paramGrid)} × 5 fold = {len(paramGrid)*5} fit")
+
+
+# ─────────────────────────────────────────────
+# 7. EVALUATOR  (F1 weighted — robusto a classi sbilanciate)
+# ─────────────────────────────────────────────
+evaluator = MulticlassClassificationEvaluator(
+    labelCol=LABEL_COL,
+    predictionCol="prediction",
+    metricName="weightedFMeasure",   # F1 pesato per frequenza di classe
+    beta=1.0
+)
+
+
+# ─────────────────────────────────────────────
+# 8. CROSS-VALIDATOR
+# ─────────────────────────────────────────────
+cv = CrossValidator(
+    estimator=pipeline,
+    estimatorParamMaps=paramGrid,
+    evaluator=evaluator,
+    numFolds=5,
+    seed=42,
+    parallelism=4,          # fit paralleli per accelerare la grid search
+    collectSubModels=False  # True solo in fase di debug (alto consumo memoria)
+)
+
+
+# ─────────────────────────────────────────────
+# 9. TRAINING
+# ─────────────────────────────────────────────
+logger.info("Avvio cross-validation...")
+cvModel = cv.fit(train_df)
+logger.info("Cross-validation completata.")
+
+
+# ─────────────────────────────────────────────
+# 10. ISPEZIONE DEL MODELLO MIGLIORE
+# ─────────────────────────────────────────────
+best_pipeline = cvModel.bestModel
+best_lr_stage = best_pipeline.stages[-1]   # ultimo stage = LogisticRegression
+
+logger.info(f"Miglior regParam       : {best_lr_stage.getRegParam()}")
+logger.info(f"Miglior elasticNetParam: {best_lr_stage.getElasticNetParam()}")
+logger.info(f"Miglior maxIter        : {best_lr_stage.getMaxIter()}")
+logger.info(f"CV avg F1 (validation) : {max(cvModel.avgMetrics):.4f}")
+
+
+# ─────────────────────────────────────────────
+# 11. VALUTAZIONE SUL TEST SET (held-out)
+# ─────────────────────────────────────────────
+predictions = best_pipeline.transform(test_df)
+
+metrics = ["weightedFMeasure", "weightedPrecision", "weightedRecall", "accuracy"]
+for metric in metrics:
+    evaluator.setMetricName(metric)
+    score = evaluator.evaluate(predictions)
+    logger.info(f"{metric:25s}: {score:.4f}")
+
+
+# ─────────────────────────────────────────────
+# 12. PERSISTENZA DEL MODELLO
+# ─────────────────────────────────────────────
+best_pipeline.write().overwrite().save(MODEL_SAVE_PATH)
+logger.info(f"Modello salvato in: {MODEL_SAVE_PATH}")
+
+
+# ─────────────────────────────────────────────
+# 13. CLEANUP
+# ─────────────────────────────────────────────
+train_df.unpersist()
+test_df.unpersist()
+spark.stop()
+logger.info("SparkSession chiusa. Pipeline completata con successo.")
